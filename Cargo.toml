@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "xtask"]
+resolver = "2"
+
 [package]
 name    = "pro-controller"
 version = "0.1.0"
