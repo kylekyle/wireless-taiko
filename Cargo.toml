@@ -1,0 +1,13 @@
+[package]
+name    = "pro-controller"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "controller"
+path = "src/main.rs"
+
+[dependencies]
+bluer  = { version = "0.17", features = ["l2cap"] }
+tokio  = { version = "1", features = ["rt", "macros", "time", "signal"] }
+anyhow = "1"
