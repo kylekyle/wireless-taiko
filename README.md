@@ -45,16 +45,19 @@ cargo install cross sccache
 
 ## Build and deploy
 
+Set `TAIKO_HOST` to your Pi's SSH target, then run:
+
 ```bash
+export TAIKO_HOST=pi@raspberrypi.local
 cargo deploy
 ```
 
-This cross-compiles for `aarch64-unknown-linux-gnu` and SCPs the binary to `pi@dom.local:~/rust/pro-controller`.
+This cross-compiles for `aarch64-unknown-linux-gnu` and SCPs the binary to `$TAIKO_HOST:~/wireless-taiko`. Override the remote path with `TAIKO_REMOTE_PATH` if needed.
 
 ## Run on the Pi
 
 ```bash
-ssh pi@dom.local sudo ~/rust/pro-controller
+ssh pi@raspberrypi.local sudo ~/wireless-taiko
 ```
 
 On the Switch: **Controllers → Change Grip/Order**. The Switch will find the adapter advertising as "Pro Controller" and pair automatically.

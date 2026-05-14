@@ -3,12 +3,12 @@ members = [".", "xtask"]
 resolver = "2"
 
 [package]
-name    = "pro-controller"
+name    = "wireless-taiko"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "controller"
+name = "wireless-taiko"
 path = "src/main.rs"
 
 [dependencies]

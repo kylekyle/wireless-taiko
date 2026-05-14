@@ -2,8 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
 
 const TARGET: &str = "aarch64-unknown-linux-gnu";
-const PI: &str = "pi@dom.local";
-const REMOTE_PATH: &str = "~/rust/pro-controller";
+const DEFAULT_REMOTE_PATH: &str = "~/wireless-taiko";
 
 fn main() {
     let task = std::env::args().nth(1);
@@ -18,6 +17,9 @@ fn main() {
 
 fn deploy() {
     let root = workspace_root();
+    let host = env_or_die("TAIKO_HOST");
+    let remote_path = std::env::var("TAIKO_REMOTE_PATH")
+        .unwrap_or_else(|_| DEFAULT_REMOTE_PATH.to_string());
 
     let sccache_dir = format!("{}/.cache/sccache", env_or_die("HOME"));
     let container_opts = format!("--volume {sccache_dir}:{sccache_dir}");
@@ -37,13 +39,12 @@ fn deploy() {
         .join("target")
         .join(TARGET)
         .join("release")
-        .join("controller");
+        .join("wireless-taiko");
 
-    println!("[deploy] Deploying to {PI}:{REMOTE_PATH}...");
-    run(Command::new("ssh").args([PI, "mkdir -p ~/rust"]));
-    run(Command::new("scp").args([binary.as_os_str(), format!("{PI}:{REMOTE_PATH}").as_ref()]));
+    println!("[deploy] Deploying to {host}:{remote_path}...");
+    run(Command::new("scp").args([binary.as_os_str(), format!("{host}:{remote_path}").as_ref()]));
 
-    println!("[deploy] Done. Run with:  ssh {PI} sudo {REMOTE_PATH}");
+    println!("[deploy] Done. Run with:  ssh {host} sudo {remote_path}");
 }
 
 fn run(cmd: &mut Command) {
