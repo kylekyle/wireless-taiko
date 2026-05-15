@@ -1,14 +1,18 @@
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use anyhow::Result;
 use bluer::{Address, AddressType};
 use bluer::l2cap::{SeqPacket, SeqPacketListener, SocketAddr};
+use tokio::sync::watch;
 use tokio::time::{interval, timeout};
 
 mod bluetooth;
 mod protocol;
+mod usb;
 
-use bluetooth::BluetoothAdapter;
-use protocol::{Handshake, Timer, idle_report};
+use bluetooth::{BluetoothManager, ControllerAdapter};
+use protocol::{ButtonState, Handshake, Timer, input_report};
 
 const PSM_CTRL: u16 = 17;
 const PSM_ITRP: u16 = 19;
@@ -26,83 +30,121 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let switch_mac: Option<Address> = std::env::args()
-        .nth(1)
-        .map(|s| s.parse().expect("invalid MAC address"));
+    let manager = Arc::new(BluetoothManager::new().await?);
 
-    let bt = BluetoothAdapter::new().await?;
-    let adapter_addr = bt.address().await?;
-    let addr_str = adapter_addr.to_string();
+    let names = manager.adapter_names().await?;
+    if names.is_empty() {
+        eprintln!("Error: no Bluetooth adapters found");
+        std::process::exit(1);
+    }
+    println!("Found {} adapter(s): {}", names.len(), names.join(", "));
+
+    let pool:   Arc<Mutex<Vec<String>>>     = Arc::new(Mutex::new(names));
+    let active: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    // spawn_local requires a LocalSet when using current_thread runtime
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let mut ticker = interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    println!("\nExiting");
+                    break;
+                }
+                _ = ticker.tick() => {
+                    let drums = usb::find_drums();
+                    let mut act = active.lock().unwrap();
+                    for path in drums {
+                        if act.contains(&path) { continue; }
+                        let adapter_name = pool.lock().unwrap().pop();
+                        match adapter_name {
+                            None => eprintln!("[main] no free adapter for drum at {path}"),
+                            Some(name) => {
+                                act.insert(path.clone());
+                                let manager = Arc::clone(&manager);
+                                let pool    = Arc::clone(&pool);
+                                let active  = Arc::clone(&active);
+                                tokio::task::spawn_local(async move {
+                                    controller_task(manager, name.clone(), path.clone()).await;
+                                    pool.lock().unwrap().push(name);
+                                    active.lock().unwrap().remove(&path);
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }).await;
+
+    Ok(())
+}
+
+async fn controller_task(manager: Arc<BluetoothManager>, adapter_name: String, drum_path: String) {
+    let adapter = match manager.setup_adapter(&adapter_name).await {
+        Ok(a)  => a,
+        Err(e) => { eprintln!("[{adapter_name}] setup failed: {e}"); return; }
+    };
+    let addr = match adapter.address().await {
+        Ok(a)  => a,
+        Err(e) => { eprintln!("[{adapter_name}] address error: {e}"); return; }
+    };
+    let addr_str = addr.to_string();
+
+    let (tx, rx) = watch::channel(ButtonState::default());
+    let drum_path_clone = drum_path.clone();
+    tokio::task::spawn_blocking(move || usb::read_drum(drum_path_clone, tx));
 
     loop {
-        let conn = if let Some(mac) = switch_mac {
-            reconnect(mac).await
-        } else {
-            connect_passive(&bt, adapter_addr).await
-        };
-
-        let (mut itrp, ctrl) = match conn {
-            Ok(pair) => pair,
-            Err(e) => {
-                eprintln!("Connection error: {} — retrying in 2s", e);
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-        };
+        if rx.has_changed().is_err() {
+            println!("[{addr_str}] drum unplugged — releasing adapter");
+            break;
+        }
 
         let quit = tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                println!("\nExiting");
-                true
-            }
-            res = run_session(&mut itrp, ctrl, &addr_str) => match res {
-                Ok(_)  => true,
-                Err(e) => { eprintln!("Lost connection: {} — reconnecting", e); false }
+            _ = tokio::signal::ctrl_c() => true,
+            res = run_connection(&adapter, addr, &addr_str, rx.clone()) => match res {
+                Ok(())  => false,
+                Err(e)  => {
+                    eprintln!("[{addr_str}] {e} — retrying in 2s");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    false
+                }
             }
         };
 
         if quit { break; }
     }
-
-    Ok(())
 }
 
-async fn connect_passive(bt: &BluetoothAdapter, addr: Address) -> Result<(SeqPacket, SeqPacket)> {
-    // Bind sockets BEFORE set_discoverable — setting discoverable resets the device class
+async fn run_connection(
+    adapter:  &ControllerAdapter,
+    addr:     Address,
+    addr_str: &str,
+    rx:       watch::Receiver<ButtonState>,
+) -> Result<()> {
+    // Bind sockets before set_discoverable — toggling discoverable resets device class
     let ln_ctrl = SeqPacketListener::bind(SocketAddr { addr, addr_type: AddressType::BrEdr, psm: PSM_CTRL, cid: 0 }).await?;
     let ln_itrp = SeqPacketListener::bind(SocketAddr { addr, addr_type: AddressType::BrEdr, psm: PSM_ITRP, cid: 0 }).await?;
 
-    // set_discoverable before set_device_class — class resets if set first
-    bt.set_discoverable(true).await?;
-    bt.set_device_class()?;
+    adapter.set_discoverable(true).await?;
+    adapter.set_device_class()?;
 
-    println!("\nListening for Switch to connect to '{}' ...", addr);
-    println!("On the Switch: Controllers → Change Grip/Order\n");
+    println!("\n[{addr_str}] Waiting — on Switch: Controllers → Change Grip/Order");
 
-    let (itrp, peer) = ln_itrp.accept().await?;
-    let (ctrl, _)    = ln_ctrl.accept().await?;
+    let (mut itrp, peer) = ln_itrp.accept().await?;
+    let (ctrl, _)        = ln_ctrl.accept().await?;
 
-    println!("Switch connected from {}", peer.addr);
-    Ok((itrp, ctrl))
-}
+    println!("[{addr_str}] Switch connected from {}", peer.addr);
 
-async fn reconnect(mac: Address) -> Result<(SeqPacket, SeqPacket)> {
-    println!("Reconnecting to Switch at {} ...", mac);
-    let ctrl = SeqPacket::connect(SocketAddr { addr: mac, addr_type: AddressType::BrEdr, psm: PSM_CTRL, cid: 0 }).await?;
-    let itrp = SeqPacket::connect(SocketAddr { addr: mac, addr_type: AddressType::BrEdr, psm: PSM_ITRP, cid: 0 }).await?;
-    println!("Connected to Switch");
-    Ok((itrp, ctrl))
-}
-
-async fn run_session(itrp: &mut SeqPacket, _ctrl: SeqPacket, addr_str: &str) -> Result<()> {
-    run_handshake(itrp, addr_str).await?;
-    idle_loop(itrp).await
+    run_handshake(&mut itrp, addr_str).await?;
+    idle_loop(&mut itrp, ctrl, rx).await
 }
 
 async fn run_handshake(itrp: &mut SeqPacket, addr_str: &str) -> Result<()> {
     let mut hs = Handshake::new(addr_str);
 
-    // Send initial idle report to prompt the Switch to start the handshake
     let init = hs.process(None);
     itrp.send(&init).await?;
 
@@ -128,9 +170,13 @@ async fn run_handshake(itrp: &mut SeqPacket, addr_str: &str) -> Result<()> {
     Ok(())
 }
 
-async fn idle_loop(itrp: &mut SeqPacket) -> Result<()> {
+async fn idle_loop(
+    itrp: &mut SeqPacket,
+    _ctrl: SeqPacket,
+    rx: watch::Receiver<ButtonState>,
+) -> Result<()> {
     let mut timer  = Timer::new();
-    let mut ticker = interval(Duration::from_micros(7576)); // ~132 Hz
+    let mut ticker = interval(Duration::from_micros(7576));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     println!("Entering idle loop (Ctrl-C to quit)");
@@ -138,13 +184,17 @@ async fn idle_loop(itrp: &mut SeqPacket) -> Result<()> {
     loop {
         ticker.tick().await;
 
-        // Drain any incoming data
         let mut buf = [0u8; 50];
         let _ = timeout(Duration::from_micros(100), itrp.recv(&mut buf)).await;
 
-        let msg = idle_report(&mut timer);
+        if rx.has_changed().is_err() {
+            return Err(anyhow::anyhow!("drum unplugged"));
+        }
+
+        let state = rx.borrow().clone();
+        let msg   = input_report(&mut timer, &state);
         itrp.send(&msg).await
-            .map_err(|e| anyhow::anyhow!("Switch disconnected: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Switch disconnected: {e}"))?;
     }
 }
 
@@ -160,7 +210,7 @@ fn check_root() {
         .unwrap_or(1);
 
     if uid != 0 {
-        eprintln!("Error: must run as root (sudo ./controller)");
+        eprintln!("Error: must run as root (sudo ./wireless-taiko)");
         std::process::exit(1);
     }
 }

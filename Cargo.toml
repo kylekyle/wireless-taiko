@@ -13,5 +13,6 @@ path = "src/main.rs"
 
 [dependencies]
 bluer  = { version = "0.17", features = ["bluetoothd", "l2cap", "rfcomm"] }
-tokio  = { version = "1", features = ["rt", "macros", "time", "signal"] }
+tokio  = { version = "1", features = ["rt", "macros", "time", "signal", "sync"] }
 anyhow = "1"
+hidapi = { version = "2", features = ["linux-native"], default-features = false }

@@ -1,5 +1,12 @@
 use std::time::Instant;
 
+#[derive(Clone, Default)]
+pub struct ButtonState {
+    pub right:  u8,  // r[4]: Y=0x01 X=0x02 B=0x04 A=0x08 R=0x40 ZR=0x80
+    pub shared: u8,  // r[5]: Minus=0x01 Plus=0x02 Home=0x10 Capture=0x20
+    pub left:   u8,  // r[6]: Down=0x01 Up=0x02 Right=0x04 Left=0x08 L=0x40 ZL=0x80
+}
+
 const CMD_DEVICE_INFO: u8      = 0x02;
 const CMD_SET_SHIPMENT: u8     = 0x08;
 const CMD_SPI_READ: u8         = 0x10;
@@ -61,9 +68,16 @@ fn fill_standard(r: &mut [u8; 50], timer: &mut Timer) {
 }
 
 pub fn idle_report(timer: &mut Timer) -> [u8; 50] {
+    input_report(timer, &ButtonState::default())
+}
+
+pub fn input_report(timer: &mut Timer, state: &ButtonState) -> [u8; 50] {
     let mut r = make_report();
     r[1] = 0x30;
     fill_standard(&mut r, timer);
+    r[4] = state.right;
+    r[5] = state.shared;
+    r[6] = state.left;
     r
 }
 

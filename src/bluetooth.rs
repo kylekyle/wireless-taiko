@@ -3,28 +3,18 @@ use anyhow::{Context, Result};
 use bluer::{Address, Adapter, Session};
 use bluer::rfcomm::{Profile, ProfileHandle};
 
-const SDP_UUID: &str     = "00001000-0000-1000-8000-00805f9b34fb";
+const SDP_UUID: &str      = "00001000-0000-1000-8000-00805f9b34fb";
 const GAMEPAD_CLASS: &str = "0x002508";
 
-pub struct BluetoothAdapter {
-    pub adapter:     Adapter,
-    _session:        Session,
+pub struct BluetoothManager {
+    session:         Session,
     _profile_handle: ProfileHandle,
 }
 
-impl BluetoothAdapter {
+impl BluetoothManager {
     pub async fn new() -> Result<Self> {
         let session = Session::new().await?;
-        let adapter = session.default_adapter().await?;
-
-        remove_known_switches(&adapter).await?;
         prepare_sdp()?;
-
-        adapter.set_powered(true).await?;
-        adapter.set_pairable(true).await?;
-        adapter.set_pairable_timeout(0).await?;
-        adapter.set_discoverable_timeout(180).await?;
-        adapter.set_alias("Pro Controller".to_string()).await?;
 
         let profile = Profile {
             uuid: SDP_UUID.parse().context("invalid SDP UUID")?,
@@ -36,13 +26,36 @@ impl BluetoothAdapter {
         };
         let _profile_handle = session.register_profile(profile).await?;
 
-        let name = adapter.name().to_string();
-        let addr = adapter.address().await?;
-        println!("Adapter {} ready at {}", name, addr);
-
-        Ok(Self { adapter, _session: session, _profile_handle })
+        Ok(Self { session, _profile_handle })
     }
 
+    pub async fn adapter_names(&self) -> Result<Vec<String>> {
+        Ok(self.session.adapter_names().await?)
+    }
+
+    pub async fn setup_adapter(&self, name: &str) -> Result<ControllerAdapter> {
+        let adapter = self.session.adapter(name)?;
+
+        remove_known_switches(&adapter).await?;
+
+        adapter.set_powered(true).await?;
+        adapter.set_pairable(true).await?;
+        adapter.set_pairable_timeout(0).await?;
+        adapter.set_discoverable_timeout(180).await?;
+        adapter.set_alias("Pro Controller".to_string()).await?;
+
+        let addr = adapter.address().await?;
+        println!("Adapter {name} ready at {addr}");
+
+        Ok(ControllerAdapter { adapter })
+    }
+}
+
+pub struct ControllerAdapter {
+    pub adapter: Adapter,
+}
+
+impl ControllerAdapter {
     pub async fn address(&self) -> Result<Address> {
         Ok(self.adapter.address().await?)
     }
@@ -79,7 +92,7 @@ async fn remove_known_switches(adapter: &Adapter) -> Result<()> {
         }
     }
     if removed > 0 {
-        println!("Cleared {} stale Nintendo Switch pairing(s)", removed);
+        println!("Cleared {removed} stale Nintendo Switch pairing(s)");
     }
     Ok(())
 }
