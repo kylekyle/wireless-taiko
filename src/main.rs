@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::Result;
 use bluer::{Address, AddressType};
 use bluer::l2cap::{SeqPacket, SeqPacketListener, SocketAddr};
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tokio::time::{interval, timeout};
 
 mod bluetooth;
@@ -39,8 +39,9 @@ async fn main() -> Result<()> {
     }
     println!("Found {} adapter(s): {}", names.len(), names.join(", "));
 
-    let pool:   Arc<Mutex<Vec<String>>>     = Arc::new(Mutex::new(names));
-    let active: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let pool:        Arc<Mutex<Vec<String>>>     = Arc::new(Mutex::new(names));
+    let active:      Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let pairing_lock: Arc<Semaphore>             = Arc::new(Semaphore::new(1));
 
     // spawn_local requires a LocalSet when using current_thread runtime
     let local = tokio::task::LocalSet::new();
@@ -61,12 +62,14 @@ async fn main() -> Result<()> {
                         match adapter_name {
                             None => eprintln!("[main] no free adapter for drum at {path}"),
                             Some(name) => {
+                                println!("[main] drum found at {path}, assigning adapter {name}");
                                 act.insert(path.clone());
-                                let manager = Arc::clone(&manager);
-                                let pool    = Arc::clone(&pool);
-                                let active  = Arc::clone(&active);
+                                let manager      = Arc::clone(&manager);
+                                let pool         = Arc::clone(&pool);
+                                let active       = Arc::clone(&active);
+                                let pairing_lock = Arc::clone(&pairing_lock);
                                 tokio::task::spawn_local(async move {
-                                    controller_task(manager, name.clone(), path.clone()).await;
+                                    controller_task(manager, name.clone(), path.clone(), pairing_lock).await;
                                     pool.lock().unwrap().push(name);
                                     active.lock().unwrap().remove(&path);
                                 });
@@ -81,7 +84,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn controller_task(manager: Arc<BluetoothManager>, adapter_name: String, drum_path: String) {
+async fn controller_task(manager: Arc<BluetoothManager>, adapter_name: String, drum_path: String, pairing_lock: Arc<Semaphore>) {
     let adapter = match manager.setup_adapter(&adapter_name).await {
         Ok(a)  => a,
         Err(e) => { eprintln!("[{adapter_name}] setup failed: {e}"); return; }
@@ -104,7 +107,7 @@ async fn controller_task(manager: Arc<BluetoothManager>, adapter_name: String, d
 
         let quit = tokio::select! {
             _ = tokio::signal::ctrl_c() => true,
-            res = run_connection(&adapter, addr, &addr_str, rx.clone()) => match res {
+            res = run_connection(&adapter, addr, &addr_str, rx.clone(), Arc::clone(&pairing_lock)) => match res {
                 Ok(())  => false,
                 Err(e)  => {
                     eprintln!("[{addr_str}] {e} — retrying in 2s");
@@ -119,14 +122,19 @@ async fn controller_task(manager: Arc<BluetoothManager>, adapter_name: String, d
 }
 
 async fn run_connection(
-    adapter:  &ControllerAdapter,
-    addr:     Address,
-    addr_str: &str,
-    rx:       watch::Receiver<ButtonState>,
+    adapter:      &ControllerAdapter,
+    addr:         Address,
+    addr_str:     &str,
+    rx:           watch::Receiver<ButtonState>,
+    pairing_lock: Arc<Semaphore>,
 ) -> Result<()> {
-    // Bind sockets before set_discoverable — toggling discoverable resets device class
+    // Bind sockets before acquiring the pairing lock so we're ready to accept immediately
     let ln_ctrl = SeqPacketListener::bind(SocketAddr { addr, addr_type: AddressType::BrEdr, psm: PSM_CTRL, cid: 0 }).await?;
     let ln_itrp = SeqPacketListener::bind(SocketAddr { addr, addr_type: AddressType::BrEdr, psm: PSM_ITRP, cid: 0 }).await?;
+
+    // Only one adapter advertises at a time — the Switch gets confused if two Pro Controllers
+    // appear simultaneously and drops one of the connections.
+    let permit = pairing_lock.acquire_owned().await?;
 
     adapter.set_discoverable(true).await?;
     adapter.set_device_class()?;
@@ -139,6 +147,10 @@ async fn run_connection(
     println!("[{addr_str}] Switch connected from {}", peer.addr);
 
     run_handshake(&mut itrp, addr_str).await?;
+
+    // Pairing complete — release lock so the next adapter can start advertising
+    drop(permit);
+
     idle_loop(&mut itrp, ctrl, rx).await
 }
 

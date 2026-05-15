@@ -82,8 +82,9 @@ pub fn input_report(timer: &mut Timer, state: &ButtonState) -> [u8; 50] {
 }
 
 pub struct Handshake {
-    bt_addr: [u8; 6],
-    timer:   Timer,
+    bt_addr:    [u8; 6],
+    body_color: [u8; 3],
+    timer:      Timer,
     pub vibration_enabled: bool,
     pub player_number:     Option<u8>,
 }
@@ -94,7 +95,11 @@ impl Handshake {
         for (i, part) in bt_addr_str.split(':').enumerate().take(6) {
             bt_addr[i] = u8::from_str_radix(part, 16).unwrap_or(0);
         }
-        Self { bt_addr, timer: Timer::new(), vibration_enabled: false, player_number: None }
+        // Derive a bright saturated color from the adapter's MAC address so each
+        // controller gets a distinct color without a random number generator.
+        let hue = bt_addr[3].wrapping_add(bt_addr[4]).wrapping_add(bt_addr[5]);
+        let body_color = hue_to_rgb(hue);
+        Self { bt_addr, body_color, timer: Timer::new(), vibration_enabled: false, player_number: None }
     }
 
     pub fn is_complete(&self) -> bool {
@@ -113,7 +118,7 @@ impl Handshake {
         match sub[0] {
             CMD_DEVICE_INFO      => self.reply_device_info(),
             CMD_SET_SHIPMENT     => self.reply_ack(0x80, 0x08),
-            CMD_SPI_READ         => { let r = self.reply_base(); spi_reply(r, sub) }
+            CMD_SPI_READ         => { let r = self.reply_base(); spi_reply(r, sub, &self.body_color) }
             CMD_SET_MODE         => self.reply_ack(0x80, 0x03),
             CMD_TRIGGER_BUTTONS  => self.reply_ack(0x83, 0x04),
             CMD_TOGGLE_IMU       => self.reply_ack(0x80, 0x40),
@@ -168,7 +173,7 @@ impl Handshake {
     }
 }
 
-fn spi_reply(mut r: [u8; 50], sub: &[u8]) -> [u8; 50] {
+fn spi_reply(mut r: [u8; 50], sub: &[u8], color: &[u8; 3]) -> [u8; 50] {
     let lo  = sub[1];
     let hi  = sub[2];
     let len = sub[5];
@@ -185,9 +190,9 @@ fn spi_reply(mut r: [u8; 50], sub: &[u8]) -> [u8; 50] {
     match (hi, lo) {
         (0x60, 0x00) => r[21..37].fill(0xFF),
         (0x60, 0x50) => {
-            r[21..24].copy_from_slice(&[0x82, 0x82, 0x82]);
-            r[24..27].copy_from_slice(&[0x0F, 0x0F, 0x0F]);
-            r[27..34].fill(0xFF);
+            r[21..24].copy_from_slice(color);           // body
+            r[24..27].copy_from_slice(&[0xFF, 0xFF, 0xFF]); // buttons: white
+            r[27..34].fill(0xFF);                       // grips: none
         }
         (0x60, 0x80) => {
             r[21..27].copy_from_slice(&[0x50, 0xFD, 0x00, 0x00, 0xC6, 0x0F]);
@@ -199,8 +204,8 @@ fn spi_reply(mut r: [u8; 50], sub: &[u8]) -> [u8; 50] {
             r[21..30].copy_from_slice(&[0xBA, 0xF5, 0x62, 0x6F, 0xC8, 0x77, 0xED, 0x95, 0x5B]);
             r[30..39].copy_from_slice(&[0x16, 0xD8, 0x7D, 0xF2, 0xB5, 0x5F, 0x86, 0x65, 0x5E]);
             r[39] = 0xFF;
-            r[40..43].copy_from_slice(&[0x82, 0x82, 0x82]);
-            r[43..46].copy_from_slice(&[0x0F, 0x0F, 0x0F]);
+            r[40..43].copy_from_slice(color);
+            r[43..46].copy_from_slice(&[0xFF, 0xFF, 0xFF]);
         }
         (0x60, 0x20) => r[21..45].copy_from_slice(&[
             0xD3, 0xFF, 0xD5, 0xFF, 0x55, 0x01,
@@ -211,4 +216,20 @@ fn spi_reply(mut r: [u8; 50], sub: &[u8]) -> [u8; 50] {
         _ => {}
     }
     r
+}
+
+// Maps a hue byte (0–255) to a fully-saturated, full-brightness RGB color.
+fn hue_to_rgb(hue: u8) -> [u8; 3] {
+    let h6     = hue as u32 * 6;
+    let sector = (h6 / 256) as u8;
+    let f      = (h6 % 256) as u8;
+    let inv    = 255 - f;
+    match sector {
+        0 => [255, f,   0  ],
+        1 => [inv, 255, 0  ],
+        2 => [0,   255, f  ],
+        3 => [0,   inv, 255],
+        4 => [f,   0,   255],
+        _ => [255, 0,   inv],
+    }
 }
