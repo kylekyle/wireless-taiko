@@ -21,7 +21,24 @@ sudo systemctl daemon-reload
 sudo systemctl restart bluetooth
 ```
 
-**2. SDP socket permissions**
+**2. Disable Secure Connections**
+
+Edit `/etc/bluetooth/main.conf` and set:
+
+```
+[Policy]
+SecureConnections = off
+```
+
+Without this, BlueZ escalates SSP to Numeric Comparison even when both sides advertise `NoInputNoOutput`, and pairing fails.
+
+Restart Bluetooth after changing the config:
+
+```bash
+sudo systemctl restart bluetooth
+```
+
+**3. SDP socket permissions**
 
 BlueZ's SDP socket must be world-writable. Add this to `/etc/rc.local` (before `exit 0`) so it survives reboots:
 
@@ -29,7 +46,7 @@ BlueZ's SDP socket must be world-writable. Add this to `/etc/rc.local` (before `
 chmod 777 /var/run/sdp
 ```
 
-**3. Unblock the radio**
+**4. Unblock the radio**
 
 ```bash
 sudo rfkill unblock all
@@ -53,6 +70,12 @@ cargo deploy
 ```
 
 This cross-compiles for `aarch64-unknown-linux-gnu` and SCPs the binary to `$TAIKO_HOST:~/wireless-taiko`. Override the remote path with `TAIKO_REMOTE_PATH` if needed.
+
+If the binary is already running on the Pi, stop it first — SCP cannot overwrite an open executable:
+
+```bash
+ssh pi@raspberrypi.local sudo pkill wireless-taiko
+```
 
 ## Run on the Pi
 
