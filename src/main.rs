@@ -1,8 +1,9 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use anyhow::Result;
-use bluer::{Address, AddressType};
+use bluer::AddressType;
 use bluer::l2cap::{SeqPacket, SeqPacketListener, SocketAddr};
 use tokio::sync::{watch, Semaphore};
 use tokio::time::{interval, timeout};
@@ -99,6 +100,22 @@ async fn controller_task(manager: Arc<BluetoothManager>, adapter_name: String, d
     let drum_path_clone = drum_path.clone();
     tokio::task::spawn_blocking(move || usb::read_drum(drum_path_clone, tx));
 
+    // Bind listeners once for the lifetime of this task. Keeping them alive means
+    // the kernel queues reconnection attempts from the Switch even while we're
+    // between sessions (no rebind delay, no missed reconnects).
+    let ln_ctrl = match SeqPacketListener::bind(SocketAddr { addr, addr_type: AddressType::BrEdr, psm: PSM_CTRL, cid: 0 }).await {
+        Ok(l)  => l,
+        Err(e) => { eprintln!("[{addr_str}] bind failed: {e}"); return; }
+    };
+    let ln_itrp = match SeqPacketListener::bind(SocketAddr { addr, addr_type: AddressType::BrEdr, psm: PSM_ITRP, cid: 0 }).await {
+        Ok(l)  => l,
+        Err(e) => { eprintln!("[{addr_str}] bind failed: {e}"); return; }
+    };
+
+    // After the first successful connection the Switch knows our MAC and can
+    // reconnect directly — no advertising needed for subsequent connections.
+    let ever_paired = Arc::new(AtomicBool::new(false));
+
     loop {
         if rx.has_changed().is_err() {
             println!("[{addr_str}] drum unplugged — releasing adapter");
@@ -107,11 +124,10 @@ async fn controller_task(manager: Arc<BluetoothManager>, adapter_name: String, d
 
         let quit = tokio::select! {
             _ = tokio::signal::ctrl_c() => true,
-            res = run_connection(&adapter, addr, &addr_str, rx.clone(), Arc::clone(&pairing_lock)) => match res {
+            res = run_connection(&adapter, &ln_ctrl, &ln_itrp, &addr_str, rx.clone(), Arc::clone(&pairing_lock), Arc::clone(&ever_paired)) => match res {
                 Ok(())  => false,
                 Err(e)  => {
-                    eprintln!("[{addr_str}] {e} — retrying in 2s");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    eprintln!("[{addr_str}] {e} — retrying");
                     false
                 }
             }
@@ -123,90 +139,107 @@ async fn controller_task(manager: Arc<BluetoothManager>, adapter_name: String, d
 
 async fn run_connection(
     adapter:      &ControllerAdapter,
-    addr:         Address,
+    ln_ctrl:      &SeqPacketListener,
+    ln_itrp:      &SeqPacketListener,
     addr_str:     &str,
     rx:           watch::Receiver<ButtonState>,
     pairing_lock: Arc<Semaphore>,
+    ever_paired:  Arc<AtomicBool>,
 ) -> Result<()> {
-    // Bind sockets before acquiring the pairing lock so we're ready to accept immediately
-    let ln_ctrl = SeqPacketListener::bind(SocketAddr { addr, addr_type: AddressType::BrEdr, psm: PSM_CTRL, cid: 0 }).await?;
-    let ln_itrp = SeqPacketListener::bind(SocketAddr { addr, addr_type: AddressType::BrEdr, psm: PSM_ITRP, cid: 0 }).await?;
+    // Disable page scan, remove any stale Switch pairing, re-enable page scan.
+    // This ensures remove_device succeeds — if the Switch is mid-connection
+    // the call fails silently, leaving a link key that causes BlueZ to treat
+    // the subsequent Just Works SSP as a re-pair and auto-reject it.
+    adapter.clear_switch_pairing().await;
 
-    // Only one adapter advertises at a time — the Switch gets confused if two Pro Controllers
-    // appear simultaneously and drops one of the connections.
-    let permit = pairing_lock.acquire_owned().await?;
+    let (mut itrp, permit) = if !ever_paired.load(Ordering::Relaxed) {
+        // Initial pairing: advertise (serialized so the Switch sees only one
+        // Pro Controller at a time in the CGO screen).
+        let permit = pairing_lock.acquire_owned().await?;
+        adapter.set_discoverable(true).await?;
+        adapter.set_device_class()?;
+        println!("\n[{addr_str}] Waiting — on Switch: Controllers → Change Grip/Order");
+        let (itrp, peer) = ln_itrp.accept().await?;
+        println!("[{addr_str}] Switch connected from {}", peer.addr);
+        ever_paired.store(true, Ordering::Relaxed);
+        (itrp, Some(permit))
+    } else {
+        // Reconnect: Switch connects directly to our known MAC — no advertising.
+        adapter.set_discoverable(true).await?;
+        adapter.set_device_class()?;
+        println!("[{addr_str}] Waiting for Switch to reconnect...");
+        let (itrp, peer) = ln_itrp.accept().await?;
+        println!("[{addr_str}] Switch reconnected from {}", peer.addr);
+        (itrp, None)
+    };
 
-    adapter.set_discoverable(true).await?;
-    adapter.set_device_class()?;
-
-    println!("\n[{addr_str}] Waiting — on Switch: Controllers → Change Grip/Order");
-
-    let (mut itrp, peer) = ln_itrp.accept().await?;
-    let (ctrl, _)        = ln_ctrl.accept().await?;
-
-    println!("[{addr_str}] Switch connected from {}", peer.addr);
-
-    run_handshake(&mut itrp, addr_str).await?;
-
-    // Pairing complete — release lock so the next adapter can start advertising
-    drop(permit);
-
-    idle_loop(&mut itrp, ctrl, rx).await
+    let (ctrl, _) = ln_ctrl.accept().await?;
+    run_loop(&mut itrp, ctrl, rx, addr_str, permit).await
 }
 
-async fn run_handshake(itrp: &mut SeqPacket, addr_str: &str) -> Result<()> {
-    let mut hs = Handshake::new(addr_str);
-
-    let init = hs.process(None);
-    itrp.send(&init).await?;
-
-    let mut received = false;
-    while !hs.is_complete() {
-        let mut buf = [0u8; 50];
-        let n = match timeout(Duration::from_millis(1), itrp.recv(&mut buf)).await {
-            Ok(Ok(n)) if n > 0 => { received = true; Some(n) }
-            _                  => None,
-        };
-
-        let reply = hs.process(n.map(|n| &buf[..n]));
-        itrp.send(&reply).await?;
-
-        if received {
-            tokio::time::sleep(Duration::from_millis(1000 / 15)).await;
-        } else {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    }
-
-    println!("Pairing complete — assigned player {}", hs.player_number.unwrap_or(0));
-    Ok(())
-}
-
-async fn idle_loop(
-    itrp: &mut SeqPacket,
-    _ctrl: SeqPacket,
-    rx: watch::Receiver<ButtonState>,
+// Unified 132 Hz loop handling both handshake and idle phases.
+// Subcommand replies are always sent immediately. Idle/input reports are
+// throttled — only sent when buttons change or once per ~1 s (132 ticks).
+// Sending idle reports on every tick floods the BT send buffer, which blocks
+// the task for 200+ ms per send and causes the Switch to time out during the
+// handshake before replies arrive.
+async fn run_loop(
+    itrp:           &mut SeqPacket,
+    _ctrl:          SeqPacket,
+    rx:             watch::Receiver<ButtonState>,
+    addr_str:       &str,
+    pairing_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<()> {
-    let mut timer  = Timer::new();
-    let mut ticker = interval(Duration::from_micros(7576));
+    let mut timer        = Timer::new();
+    let mut hs           = Handshake::new(addr_str);
+    let mut permit       = pairing_permit;
+    let mut ticker       = interval(Duration::from_micros(7576));
+    let mut idle_ticks:  u32        = 0;
+    let mut last_buttons = ButtonState::default();
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    println!("Entering idle loop (Ctrl-C to quit)");
+    let init = hs.process(None);
+    itrp.send(&init).await
+        .map_err(|e| anyhow::anyhow!("Switch disconnected: {e}"))?;
 
     loop {
         ticker.tick().await;
+        idle_ticks = idle_ticks.wrapping_add(1);
 
         let mut buf = [0u8; 50];
-        let _ = timeout(Duration::from_micros(100), itrp.recv(&mut buf)).await;
+        let n = match timeout(Duration::from_micros(100), itrp.recv(&mut buf)).await {
+            Ok(Ok(0))  => return Err(anyhow::anyhow!("Switch disconnected")),
+            Ok(Ok(n))  => n,
+            Ok(Err(e)) => return Err(anyhow::anyhow!("Switch disconnected: {e}")),
+            Err(_)     => 0,
+        };
 
         if rx.has_changed().is_err() {
             return Err(anyhow::anyhow!("drum unplugged"));
         }
 
-        let state = rx.borrow().clone();
-        let msg   = input_report(&mut timer, &state);
-        itrp.send(&msg).await
-            .map_err(|e| anyhow::anyhow!("Switch disconnected: {e}"))?;
+        if n > 0 && buf[0] == 0xA2 {
+            let reply = hs.process(Some(&buf[..n]));
+            if permit.is_some() && hs.is_complete() {
+                println!("Pairing complete — assigned player {}", hs.player_number.unwrap_or(0));
+                drop(permit.take());
+            }
+            itrp.send(&reply).await
+                .map_err(|e| anyhow::anyhow!("Switch disconnected: {e}"))?;
+        } else {
+            let state = rx.borrow().clone();
+            // Throttle during handshake to avoid flooding BT buffer (which would
+            // delay subcommand replies and cause the Switch to time out).
+            // After handshake, send at ~60 Hz to keep the Switch connection alive.
+            let threshold = if hs.is_complete() { 2 } else { 132 };
+            if state != last_buttons || idle_ticks >= threshold {
+                let msg = input_report(&mut timer, &state);
+                itrp.send(&msg).await
+                    .map_err(|e| anyhow::anyhow!("Switch disconnected: {e}"))?;
+                last_buttons = state;
+                idle_ticks = 0;
+            }
+        }
     }
 }
 

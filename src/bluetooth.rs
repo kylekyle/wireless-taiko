@@ -1,6 +1,8 @@
 use std::process::Command;
+use std::time::Duration;
 use anyhow::{Context, Result};
 use bluer::{Address, Adapter, Session};
+use bluer::agent::{Agent, AgentHandle};
 use bluer::rfcomm::{Profile, ProfileHandle};
 
 const SDP_UUID: &str      = "00001000-0000-1000-8000-00805f9b34fb";
@@ -8,6 +10,7 @@ const GAMEPAD_CLASS: &str = "0x002508";
 
 pub struct BluetoothManager {
     session:         Session,
+    _agent_handle:   AgentHandle,
     _profile_handle: ProfileHandle,
 }
 
@@ -15,6 +18,13 @@ impl BluetoothManager {
     pub async fn new() -> Result<Self> {
         let session = Session::new().await?;
         prepare_sdp()?;
+
+        // NoInputNoOutput (default when no callbacks set) → Just Works SSP →
+        // no User Confirmation Request, auto-pairs without agent interaction.
+        let _agent_handle = session.register_agent(Agent {
+            request_default: true,
+            ..Default::default()
+        }).await?;
 
         let profile = Profile {
             uuid: SDP_UUID.parse().context("invalid SDP UUID")?,
@@ -26,7 +36,7 @@ impl BluetoothManager {
         };
         let _profile_handle = session.register_profile(profile).await?;
 
-        Ok(Self { session, _profile_handle })
+        Ok(Self { session, _agent_handle, _profile_handle })
     }
 
     pub async fn adapter_names(&self) -> Result<Vec<String>> {
@@ -41,7 +51,7 @@ impl BluetoothManager {
         adapter.set_powered(true).await?;
         adapter.set_pairable(true).await?;
         adapter.set_pairable_timeout(0).await?;
-        adapter.set_discoverable_timeout(180).await?;
+        adapter.set_discoverable_timeout(0).await?;
         adapter.set_alias("Pro Controller".to_string()).await?;
 
         let addr = adapter.address().await?;
@@ -75,6 +85,32 @@ impl ControllerAdapter {
             .context("hciconfig failed to spawn")?;
         anyhow::ensure!(status.success(), "hciconfig class failed");
         Ok(())
+    }
+
+    /// Remove any known Nintendo Switch pairings so BlueZ treats the next
+    /// connection as a new device, enabling Just Works SSP auto-accept.
+    ///
+    /// Temporarily disables page scan so the Switch cannot reconnect while
+    /// we call remove_device — if the Switch is mid-connection, remove_device
+    /// fails silently and the stale record (with link key) remains, causing
+    /// BlueZ to treat the next SSP as a re-pair and auto-reject Just Works.
+    pub async fn clear_switch_pairing(&self) {
+        let name = self.adapter.name();
+        let _ = Command::new("hciconfig").args([name, "noscan"]).status();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        if let Ok(addrs) = self.adapter.device_addresses().await {
+            for addr in addrs {
+                if let Ok(dev) = self.adapter.device(addr) {
+                    if dev.alias().await.map(|a| a.to_uppercase() == "NINTENDO SWITCH").unwrap_or(false) {
+                        let _ = dev.disconnect().await;
+                        let _ = self.adapter.remove_device(addr).await;
+                    }
+                }
+            }
+        }
+
+        let _ = Command::new("hciconfig").args([name, "pscan"]).status();
     }
 }
 
