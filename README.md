@@ -2,6 +2,8 @@
 
 Makes USB Taiko drums wireless on the Nintendo Switch using a Raspberry Pi. The Pi advertises itself as a Pro Controller over Bluetooth and forwards drum hits as button presses.
 
+You need one Bluetooth adapter per drum — each drum pairs as an independent controller. The Raspberry Pi 4 has one built-in adapter; add USB Bluetooth dongles for additional drums.
+
 ## Raspberry Pi setup
 
 Tested on Raspberry Pi 4 Model B running Raspberry Pi OS Lite (64-bit).
