@@ -11,6 +11,7 @@ edition = "2021"
 name = "wireless-taiko"
 path = "src/main.rs"
 
+
 [dependencies]
 bluer  = { version = "0.17", features = ["bluetoothd", "l2cap", "rfcomm"] }
 tokio  = { version = "1", features = ["rt", "macros", "time", "signal", "sync"] }
