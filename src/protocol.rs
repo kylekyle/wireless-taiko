@@ -147,15 +147,22 @@ pub struct Handshake {
 }
 
 impl Handshake {
-    // Derives a unique body color from the adapter MAC so multiple controllers
-    // are visually distinct on-screen without a random-number generator.
+    // Assigns a primary body color from the adapter MAC so multiple controllers
+    // are visually distinct on-screen. XOR of all six MAC bytes indexes into the
+    // color table, giving a stable, deterministic color per adapter.
     pub fn new(bt_addr_str: &str) -> Self {
+        const COLORS: [[u8; 3]; 4] = [
+            [0xFF, 0x00, 0x00], // red
+            [0x00, 0x00, 0xFF], // blue
+            [0x00, 0xB0, 0x00], // green
+            [0xFF, 0xC0, 0x00], // yellow
+        ];
         let mut bt_addr = [0u8; 6];
         for (i, part) in bt_addr_str.split(':').enumerate().take(6) {
             bt_addr[i] = u8::from_str_radix(part, 16).unwrap_or(0);
         }
-        let hue = bt_addr[3].wrapping_add(bt_addr[4]).wrapping_add(bt_addr[5]);
-        let body_color = hue_to_rgb(hue);
+        let idx = bt_addr.iter().fold(0u8, |acc, &b| acc ^ b) as usize % COLORS.len();
+        let body_color = COLORS[idx];
         Self { bt_addr, body_color, timer: Timer::new(), vibration_enabled: false, player_number: None }
     }
 
@@ -314,20 +321,3 @@ fn spi_reply(mut r: [u8; 50], sub: &[u8], color: &[u8; 3]) -> [u8; 50] {
     r
 }
 
-// Maps a hue byte (0–255) to a fully-saturated, full-brightness RGB color.
-// Used to give each controller a unique on-screen body color derived from
-// the last three bytes of its Bluetooth MAC address.
-fn hue_to_rgb(hue: u8) -> [u8; 3] {
-    let h6     = hue as u32 * 6;
-    let sector = (h6 / 256) as u8;
-    let f      = (h6 % 256) as u8;
-    let inv    = 255 - f;
-    match sector {
-        0 => [255, f,   0  ],
-        1 => [inv, 255, 0  ],
-        2 => [0,   255, f  ],
-        3 => [0,   inv, 255],
-        4 => [f,   0,   255],
-        _ => [255, 0,   inv],
-    }
-}

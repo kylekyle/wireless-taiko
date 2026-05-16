@@ -8,10 +8,10 @@
 //   byte 0 — face/drum buttons
 //             bit 0: Y           bit 1: B           bit 2: A        bit 3: X
 //             bit 4: DPAD_LEFT   bit 5: DPAD_RIGHT
-//             bit 6: left rim (ka)                  bit 7: right rim (ka)
+//             bit 6: left rim (ka) → L              bit 7: right rim (ka) → R
 //   byte 1 — menu + extra drum buttons
 //             bit 0: MINUS       bit 1: PLUS
-//             bit 2: left center (don)              bit 3: right center (don)
+//             bit 2: left center (don) → B          bit 3: right center (don) → A
 //             bit 4: HOME        bit 5: CAPTURE
 //   byte 2 — hat switch (d-pad encoded as compass direction)
 //             0=Up  2=Right  4=Down  6=Left  0x0F=idle (no press)
@@ -101,14 +101,14 @@ fn hid_to_button_state(raw: &[u8]) -> ButtonState {
     if b0 & 0x08 != 0 { right  |= 0x02; } // X
     if b0 & 0x10 != 0 { left   |= 0x08; } // DPAD_LEFT
     if b0 & 0x20 != 0 { left   |= 0x04; } // DPAD_RIGHT
-    if b0 & 0x40 != 0 { left   |= 0x08; } // left ka  → DPAD_LEFT
-    if b0 & 0x80 != 0 { right  |= 0x08; } // right ka → A
+    if b0 & 0x40 != 0 { left   |= 0x40; } // left ka  → L
+    if b0 & 0x80 != 0 { right  |= 0x40; } // right ka → R
 
     // byte 1 — menu buttons and drum center (don)
     if b1 & 0x01 != 0 { shared |= 0x01; } // MINUS
     if b1 & 0x02 != 0 { shared |= 0x02; } // PLUS
-    if b1 & 0x04 != 0 { left   |= 0x01; } // left don  → DOWN
-    if b1 & 0x08 != 0 { right  |= 0x04; } // right don → B
+    if b1 & 0x04 != 0 { right  |= 0x04; } // left don  → B
+    if b1 & 0x08 != 0 { right  |= 0x08; } // right don → A
     if b1 & 0x10 != 0 { shared |= 0x10; } // HOME
     if b1 & 0x20 != 0 { shared |= 0x20; } // CAPTURE
 
