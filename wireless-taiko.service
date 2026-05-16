@@ -1,0 +1,12 @@
+[Unit]
+Description=Wireless Taiko drum Pro Controller bridge
+After=bluetooth.target
+Requires=bluetooth.target
+
+[Service]
+ExecStart=/home/pi/wireless-taiko
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

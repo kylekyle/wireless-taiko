@@ -52,15 +52,40 @@ chmod 777 /var/run/sdp
 sudo rfkill unblock all
 ```
 
-## Build and deploy
+## Install
 
-Pre-built `aarch64` binaries (Raspberry Pi 4) are on the [Releases](https://github.com/kylekyle/wireless-taiko/releases) page. Download and copy to the Pi:
+Download the latest `wireless-taiko` binary from the [Releases](https://github.com/kylekyle/wireless-taiko/releases) page and copy it to the Pi:
 
 ```bash
 scp wireless-taiko pi@raspberrypi.local:~/
+ssh pi@raspberrypi.local chmod +x ~/wireless-taiko
 ```
 
-### Build from source
+## Run as a service
+
+Download `wireless-taiko.service` from the [Releases](https://github.com/kylekyle/wireless-taiko/releases) page (or copy it from the repo) and install it:
+
+```bash
+sudo cp wireless-taiko.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now wireless-taiko
+```
+
+The service starts on boot, restarts automatically on failure, and logs to journald:
+
+```bash
+journalctl -u wireless-taiko -f
+```
+
+To update the binary, stop the service first — the file cannot be replaced while the process is running:
+
+```bash
+sudo systemctl stop wireless-taiko
+# copy new binary
+sudo systemctl start wireless-taiko
+```
+
+## Build from source
 
 You need [cross](https://github.com/cross-rs/cross) and [sccache](https://github.com/mozilla/sccache) installed, and Docker running:
 
@@ -77,13 +102,7 @@ cargo deploy
 
 This cross-compiles for `aarch64-unknown-linux-gnu` and SCPs the binary to `$TAIKO_HOST:~/wireless-taiko`. Override the remote path with `TAIKO_REMOTE_PATH` if needed.
 
-If the binary is already running on the Pi, stop it first — SCP cannot overwrite an open executable:
-
-```bash
-ssh pi@raspberrypi.local sudo pkill wireless-taiko
-```
-
-## Run on the Pi
+## Run manually
 
 ```bash
 ssh pi@raspberrypi.local sudo ~/wireless-taiko
