@@ -52,15 +52,21 @@ chmod 777 /var/run/sdp
 sudo rfkill unblock all
 ```
 
-## Dev machine setup
+## Build and deploy
 
-You need [cross](https://github.com/cross-rs/cross) and [sccache](https://github.com/mozilla/sccache) installed, and Docker running.
+Pre-built `aarch64` binaries (Raspberry Pi 4) are on the [Releases](https://github.com/kylekyle/wireless-taiko/releases) page. Download and copy to the Pi:
+
+```bash
+scp wireless-taiko pi@raspberrypi.local:~/
+```
+
+### Build from source
+
+You need [cross](https://github.com/cross-rs/cross) and [sccache](https://github.com/mozilla/sccache) installed, and Docker running:
 
 ```bash
 cargo install cross sccache
 ```
-
-## Build and deploy
 
 Set `TAIKO_HOST` to your Pi's SSH target, then run:
 
